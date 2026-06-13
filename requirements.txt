@@ -1,0 +1,14 @@
+torch>=2.1.0
+transformers>=4.40.0
+trl>=0.9.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+vllm>=0.4.0
+langchain>=0.2.0
+datasets>=2.18.0
+wandb>=0.16.0
+sympy>=1.12
+scipy>=1.11.0
+pytest>=8.0.0
+sentence-transformers>=2.7.0
+pyyaml>=6.0
