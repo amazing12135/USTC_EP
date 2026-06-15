@@ -1,13 +1,21 @@
 #!/usr/bin/env python
 """Phase 3：GRPO 训练脚本。
 
-功能：
-1. 初始化 GRPO 训练器（policy_model + ref_model + vLLM sampler）
-2. 运行 GRPO 训练循环（采样 → reward → advantage → 策略更新）
-3. Wandb 监控
-4. 定期保存 checkpoint 并在验证集上评估
+完整流程：
+1. 加载 RFT checkpoint → policy_model + ref_model
+2. vLLM 推理引擎（用于 rollout 采样）
+3. GRPO 训练循环：采样 → reward → 计算 loss → 更新策略
+4. Wandb 监控 + 定期 checkpoint
+5. 训练完自动在验证集评估
+
+用法:
+  python scripts/03_grpo_train.py                    # 正式训练
+  python scripts/03_grpo_train.py --small-scale      # 小规模调参（1K, 100步）
 """
 
+import argparse
+import json
+import random
 import sys
 from pathlib import Path
 
@@ -20,76 +28,239 @@ from utils.helpers import set_seed, Timer
 logger = get_logger(__name__)
 
 
-def main():
-    """GRPO 训练主流程。"""
-    logger.info("=== Phase 3: GRPO 训练开始 ===")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="GRPO 训练")
+    parser.add_argument(
+        "--checkpoint", type=str, default="checkpoints/rft/round_2",
+        help="RFT/SFT checkpoint 路径（作为 GRPO 起点）",
+    )
+    parser.add_argument(
+        "--small-scale", action="store_true",
+        help="小规模调参模式（1K 数据, 100 步）",
+    )
+    return parser.parse_args()
 
-    # 1. 加载配置
+
+def main() -> None:
+    args = parse_args()
     config = ConfigParser()
-    set_seed(config.training.get("seed", 42))
     rl_config = config.rl
+    seed = config.get("training.seed", 42)
+    set_seed(seed)
 
-    # 2. 初始化
-    logger.info(f"算法: {rl_config.get('algorithm', 'grpo')}")
-    logger.info(f"batch_size: {rl_config.get('batch_size', 16)}")
-    logger.info(f"group_size: {rl_config.get('group_size', 8)}")
-    logger.info(f"kl_coef: {rl_config.get('kl_coef', 0.04)}")
-    logger.info(f"learning_rate: {rl_config.get('learning_rate', 2e-6)}")
-    logger.info(f"max_steps: {rl_config.get('max_steps', 500)}")
+    # ---- 小规模调参参数覆盖 ----
+    if args.small_scale:
+        max_steps = 100
+        batch_size = 8
+        group_size = 4
+        eval_every = 25
+        save_every = 50
+        wandb_mode = "tuning"
+        logger.info("=== Phase 3: GRPO 训练（小规模调参） ===")
+    else:
+        max_steps = rl_config.get("max_steps", 500)
+        batch_size = rl_config.get("batch_size", 16)
+        group_size = rl_config.get("group_size", 8)
+        eval_every = rl_config.get("eval_every", 50)
+        save_every = rl_config.get("save_every", 100)
+        wandb_mode = "formal"
+        logger.info("=== Phase 3: GRPO 训练 ===")
 
-    # 3. 加载模型
-    logger.info(f"加载基座模型: {config.model.get('name')}")
-    # TODO: 需要 GPU 环境
-    # from model.loader import ModelLoader
-    # from model.inference import BatchInference
-    # from agent.react_agent import ReActAgent
-    # from rl.sampler import TrajectorySampler
-    # from rl.reward import RewardFunction
-    # from rl.grpo_trainer import GRPOTrainer
-    # from data.dataset import DatasetManager
-    #
-    # loader = ModelLoader(model_name=config.model["name"])
-    # policy_model = loader.load_for_training()
-    # ref_model = loader.load_for_training()  # 冻结的参考模型
-    #
-    # # vLLM 推理引擎
-    # inference = BatchInference(model_name_or_path=config.model["name"])
-    #
-    # # Agent + Sampler
-    # agent = ReActAgent(model=inference, ...)
-    # sampler = TrajectorySampler(
-    #     agent=agent,
-    #     batch_size=rl_config.get("batch_size", 16),
-    #     group_size=rl_config.get("group_size", 8),
-    # )
-    #
-    # # 初始化 Wandb
-    # import wandb
-    # wandb.init(project=config.training.get("wandb_project", "llm-math-agent"))
-    #
-    # # GRPO Trainer
-    # trainer = GRPOTrainer(
-    #     policy_model=policy_model,
-    #     ref_model=ref_model,
-    #     sampler=sampler,
-    #     reward_fn=RewardFunction(),
-    #     kl_coef=rl_config.get("kl_coef", 0.04),
-    #     clip_eps=rl_config.get("clip_eps", 0.2),
-    # )
-    #
-    # # 训练循环
-    # dm = DatasetManager(data_config=config.data)
-    # train_data = dm.load_l2_data()
-    #
-    # for step in range(rl_config.get("max_steps", 500)):
-    #     metrics = trainer.train_step(train_data)
-    #     if step % rl_config.get("eval_every", 50) == 0:
-    #         logger.info(f"Step {step}: reward_mean={metrics['reward_mean']:.3f}")
-    #         wandb.log(metrics)
-    #     if step % rl_config.get("save_every", 100) == 0:
-    #         trainer.save_checkpoint()
+    logger.info(f"  Checkpoint:     {args.checkpoint}")
+    logger.info(f"  Max steps:      {max_steps}")
+    logger.info(f"  Batch size:     {batch_size}")
+    logger.info(f"  Group size:     {group_size}")
+    logger.info(f"  KL coef:        {rl_config.get('kl_coef', 0.04)}")
+    logger.info(f"  Clip eps:       {rl_config.get('clip_eps', 0.2)}")
+    logger.info(f"  Learning rate:  {rl_config.get('learning_rate', 2e-6)}")
+    logger.info(f"  Mode:           {wandb_mode}")
 
-    logger.info("=== GRPO 训练完成（当前为骨架代码，需在 GPU 环境运行）===")
+    # ================================================================
+    # 1. 初始化 Wandb
+    # ================================================================
+    try:
+        import wandb
+        wandb.init(
+            project=config.get("training.wandb_project", "llm-math-agent"),
+            name=f"grpo-{wandb_mode}",
+            config={
+                "model": config.get("model.name"),
+                "checkpoint": args.checkpoint,
+                "batch_size": batch_size,
+                "group_size": group_size,
+                "kl_coef": rl_config.get("kl_coef", 0.04),
+                "clip_eps": rl_config.get("clip_eps", 0.2),
+                "learning_rate": rl_config.get("learning_rate", 2e-6),
+                "max_steps": max_steps,
+                "mode": wandb_mode,
+            },
+        )
+    except ImportError:
+        logger.warning("Wandb 未安装，跳过监控。安装: pip install wandb")
+        wandb = None
+
+    # ================================================================
+    # 2. 加载模型
+    # ================================================================
+    logger.info("加载模型...")
+    from model.loader import ModelLoader
+    from model.inference import BatchInference
+
+    loader = ModelLoader(model_name=config.get("model.name"))
+    tokenizer = loader.load_tokenizer()
+
+    # vLLM 推理引擎（从 checkpoint 加载，用于 rollout）
+    inference = BatchInference(
+        model_name_or_path=args.checkpoint,
+        max_model_len=config.get("data.max_seq_length", 2048),
+    )
+
+    # policy_model: 可训练的 LoRA
+    policy_model = loader.load_for_training(lora_config=config.lora)
+    # ref_model: 冻结的 LoRA（用于 KL 约束）
+    ref_model = loader.load_ref_model(lora_config=config.lora)
+
+    # ================================================================
+    # 3. 初始化 Agent + Sampler
+    # ================================================================
+    from agent.react_agent import ReActAgent
+    from rl.sampler import TrajectorySampler
+    from rl.reward import RewardFunction
+    from rl.grpo_trainer import GRPOTrainer
+
+    agent = ReActAgent(
+        model=inference,
+        max_turns=config.get("agent.max_turns", 10),
+    )
+
+    sampler = TrajectorySampler(
+        agent=agent,
+        batch_size=batch_size,
+        group_size=group_size,
+        temperature=rl_config.get("temperature", 1.0),
+    )
+
+    # ================================================================
+    # 4. GRPO Trainer
+    # ================================================================
+    trainer = GRPOTrainer(
+        policy_model=policy_model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        sampler=sampler,
+        reward_fn=RewardFunction(),
+        kl_coef=rl_config.get("kl_coef", 0.04),
+        clip_eps=rl_config.get("clip_eps", 0.2),
+        max_grad_norm=rl_config.get("max_grad_norm", 1.0),
+        learning_rate=rl_config.get("learning_rate", 2e-6),
+        checkpoint_dir=config.get("training.checkpoint_dir", "./checkpoints") + "/grpo",
+    )
+
+    # ================================================================
+    # 5. 加载数据
+    # ================================================================
+    from data.dataset import DatasetManager
+
+    dm = DatasetManager(data_config=config.data)
+    train_data = dm.load_l2_data()
+    train_size = min(len(train_data), config.get("data.l2_train_size", 9000))
+    train_data = train_data[:train_size]
+    logger.info(f"训练集: {len(train_data)} 题")
+
+    val_data = train_data[-200:] if len(train_data) > 200 else train_data
+    logger.info(f"验证集: {len(val_data)} 题（取训练集后 200 题）")
+
+    # ================================================================
+    # 6. 训练循环
+    # ================================================================
+    logger.info(f"\n开始 GRPO 训练 ({max_steps} steps)...")
+    best_reward = -float("inf")
+    best_ckpt_path = None
+
+    with Timer("GRPO Training"):
+        for step in range(max_steps):
+            # 随机采样 batch
+            batch = random.sample(train_data, min(batch_size, len(train_data)))
+
+            # 一步训练
+            metrics = trainer.train_step(batch)
+
+            # 终端日志（每 10 步）
+            if step % 10 == 0:
+                logger.info(
+                    f"  Step {step:4d}/{max_steps} | "
+                    f"loss={metrics.get('loss', 0):.4f} | "
+                    f"reward={metrics.get('reward_mean', 0):.3f}±{metrics.get('reward_std', 0):.3f} | "
+                    f"kl={metrics.get('kl_div', 0):.4f}"
+                )
+
+            # Wandb 上报
+            trainer.maybe_log_wandb(metrics)
+
+            # ---- 定期评估 ----
+            if (step + 1) % eval_every == 0:
+                logger.info(f"\n--- Eval @ Step {step+1} ---")
+                eval_metrics = _eval_on_subset(
+                    agent, sampler, val_data[:50], trainer
+                )
+                logger.info(
+                    f"  Val reward: {eval_metrics['reward_mean']:.3f}±{eval_metrics['reward_std']:.3f} | "
+                    f"accuracy: {eval_metrics.get('accuracy', 0)*100:.1f}%"
+                )
+                if wandb:
+                    wandb.log({"eval/" + k: v for k, v in eval_metrics.items()},
+                              step=step + 1)
+
+            # ---- 保存 checkpoint ----
+            if (step + 1) % save_every == 0:
+                ckpt_path = trainer.save_checkpoint()
+                current_reward = metrics.get("reward_mean", 0)
+                if current_reward > best_reward:
+                    best_reward = current_reward
+                    best_ckpt_path = trainer.save_checkpoint(
+                        trainer.checkpoint_dir / "best"
+                    )
+                    logger.info(f"  >> Best checkpoint (reward={best_reward:.3f})")
+
+    # ================================================================
+    # 7. 最终保存
+    # ================================================================
+    final_ckpt = trainer.save_checkpoint()
+    logger.info(f"\n{'='*50}")
+    logger.info("GRPO 训练完成")
+    logger.info(f"  Best reward: {best_reward:.3f}")
+    logger.info(f"  Best checkpoint: {best_ckpt_path}")
+    logger.info(f"  Final checkpoint: {final_ckpt}")
+    logger.info(f"{'='*50}")
+
+    # 训练历史
+    log_path = Path("outputs") / "grpo_history.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(trainer.metrics_history, f, indent=2, default=str)
+    logger.info(f"训练历史: {log_path}")
+
+    if wandb:
+        wandb.finish()
+
+
+def _eval_on_subset(agent, sampler, val_problems, trainer) -> dict:
+    """在验证子集上评估当前模型。"""
+    import numpy as np
+    from evaluation.metrics import MetricsCalculator
+
+    trajectories = sampler.sample_batch(val_problems)
+    metrics_calc = MetricsCalculator()
+    result = metrics_calc.compute_all(trajectories)
+
+    rewards = trainer.reward_fn.compute_batch(trajectories)
+    return {
+        "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
+        "reward_std": float(np.std(rewards)) if rewards else 0.0,
+        "accuracy": result.accuracy,
+        "avg_turns": result.avg_turns,
+        "tool_success_rate": result.tool_success_rate,
+    }
 
 
 if __name__ == "__main__":
