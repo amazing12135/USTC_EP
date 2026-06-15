@@ -1,13 +1,23 @@
 #!/usr/bin/env python
 """Phase 2：RFT Baseline 训练脚本。
 
-功能：
-1. 用当前模型对训练集采样
-2. 筛选正确轨迹
-3. 用正确轨迹做 SFT 微调
-4. 评估并记录轨迹到 MD 记忆库
+流程：
+1. 加载 SFT checkpoint (Phase 1 产物)
+2. 用当前模型对 L2 (MATH) 训练集采样
+3. 筛选正确轨迹
+4. 用正确轨迹做 SFT 微调
+5. 评估并记录轨迹到 MD 记忆库
+6. 可选：多轮迭代
+
+用法（AutoDL 云端）：
+  python scripts/02_rft_train.py
+
+用法（本地测试采样逻辑）：
+  python scripts/02_rft_train.py --mock-run
 """
 
+import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -20,42 +30,116 @@ from utils.helpers import set_seed, Timer
 logger = get_logger(__name__)
 
 
-def main():
-    """RFT 训练主流程。"""
-    logger.info("=== Phase 2: RFT Baseline 训练开始 ===")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="RFT Baseline 训练")
+    parser.add_argument(
+        "--sft-checkpoint", type=str, default="checkpoints/sft",
+        help="Phase 1 SFT checkpoint 路径",
+    )
+    parser.add_argument(
+        "--mock-run", action="store_true",
+        help="Mock 模式：只验证数据流和逻辑，不实际训练",
+    )
+    return parser.parse_args()
 
-    # 1. 加载配置
+
+def main() -> None:
+    args = parse_args()
     config = ConfigParser()
-    set_seed(config.training.get("seed", 42))
+    set_seed(config.get("training.seed", 42))
     rl_config = config.rl
 
-    # 2. 加载模型和 Agent
-    logger.info(f"加载模型: {config.model.get('name')}")
-    # TODO: 需要 GPU 环境
-    # from model.loader import ModelLoader
-    # from agent.react_agent import ReActAgent
-    # from data.dataset import DatasetManager
-    # from rl.rft_trainer import RFTTrainer
-    #
-    # loader = ModelLoader(model_name=config.model["name"])
-    # model = loader.load_for_inference()
-    # agent = ReActAgent(model=model, ...)
-    # dm = DatasetManager(data_config=config.data)
-    # train_data = dm.load_l2_data()
-    #
-    # trainer = RFTTrainer(
-    #     agent=agent,
-    #     model=model,
-    #     temperature=rl_config.get("rft_temperature", 0.8),
-    #     filter_ratio=rl_config.get("rft_filter_ratio", 0.5),
-    #     epochs=rl_config.get("rft_epochs", 2),
-    #     rounds=rl_config.get("rft_rounds", 2),
-    # )
-    #
-    # history = trainer.iterate(train_data)
-    # logger.info(f"RFT 完成，最终准确率: {history['accuracy'][-1]:.3f}")
+    logger.info("=== Phase 2: RFT Baseline 训练 ===")
+    logger.info(f"  SFT checkpoint: {args.sft_checkpoint}")
+    logger.info(f"  RFT rounds: {rl_config.get('rft_rounds', 2)}")
+    logger.info(f"  Temperature: {rl_config.get('rft_temperature', 0.8)}")
+    logger.info(f"  Epochs/round: {rl_config.get('rft_epochs', 2)}")
 
-    logger.info("=== RFT 训练完成（当前为骨架代码，需在 GPU 环境运行）===")
+    # ---- 1. 加载数据 ----
+    from data.dataset import DatasetManager
+
+    dm = DatasetManager(data_config=config.data)
+    train_data = dm.load_l2_data()
+    val_data = dm.load_l2_data()
+    val_size = config.get("data.l2_val_size", 1000)
+    train_size = min(len(train_data), config.get("data.l2_train_size", 9000))
+    train_data = train_data[:train_size]
+    val_data = val_data[-val_size:]
+
+    logger.info(f"  训练集: {len(train_data)} 题")
+    logger.info(f"  验证集: {len(val_data)} 题")
+
+    if args.mock_run:
+        logger.info("--- Mock Run: 验证数据流 ---")
+        verify_data(train_data[:10])
+        verify_data(val_data[:5])
+        logger.info("  数据流验证通过")
+        return
+
+    # ---- 2. 加载模型 ----
+    from model.loader import ModelLoader
+    from model.inference import BatchInference
+    from agent.react_agent import ReActAgent
+
+    loader = ModelLoader(model_name=config.get("model.name"))
+    tokenizer = loader.load_tokenizer()
+
+    inference = BatchInference(
+        model_name_or_path=args.sft_checkpoint,
+        max_model_len=config.get("data.max_seq_length", 2048),
+    )
+    policy_model = loader.load_for_training(lora_config=config.lora)
+    agent = ReActAgent(model=inference, max_turns=config.get("agent.max_turns", 10))
+
+    # ---- 3. RFT 训练 ----
+    from rl.rft_trainer import RFTTrainer
+
+    trainer = RFTTrainer(
+        agent=agent,
+        model=policy_model,
+        tokenizer=tokenizer,
+        temperature=rl_config.get("rft_temperature", 0.8),
+        filter_ratio=rl_config.get("rft_filter_ratio", 0.5),
+        epochs=rl_config.get("rft_epochs", 2),
+        rounds=rl_config.get("rft_rounds", 2),
+        output_dir=config.get("training.checkpoint_dir", "./checkpoints") + "/rft",
+        memory_dir="data/memory_store",
+    )
+
+    with Timer("RFT Training"):
+        history = trainer.iterate(
+            dataset=train_data,
+            n_rounds=rl_config.get("rft_rounds", 2),
+            val_dataset=val_data,
+        )
+
+    # ---- 4. 输出结果 ----
+    logger.info(f"\n{'='*50}")
+    logger.info("RFT 训练完成")
+    logger.info(f"{'='*50}")
+    for i in range(len(history["rounds"])):
+        r = history["rounds"][i]
+        c = history["train_correct"][i]
+        t = history["train_total"][i]
+        a = history["val_accuracy"][i]
+        logger.info(f"  Round {r}: train {c}/{t} ({c/t*100:.1f}%)"
+                     f", val acc={a*100:.1f}%" if a else "")
+        logger.info(f"    checkpoint: {history['checkpoint_dirs'][i]}")
+
+    # 保存历史记录
+    log_path = Path("outputs") / "rft_history.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False, default=str)
+    logger.info(f"训练历史: {log_path}")
+
+
+def verify_data(problems):
+    """验证数据流格式。"""
+    for i, p in enumerate(problems):
+        logger.info(f"  [{i}] category={p.category}, "
+                     f"question={p.question[:60]}..., "
+                     f"answer={p.answer[:30]}...")
 
 
 if __name__ == "__main__":
