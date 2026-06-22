@@ -240,8 +240,68 @@ def main() -> None:
         json.dump(trainer.metrics_history, f, indent=2, default=str)
     logger.info(f"训练历史: {log_path}")
 
+    # ---- 8. 自动生成图表 ----
+    _generate_training_plots(trainer.metrics_history)
+
     if wandb:
         wandb.finish()
+
+
+def _generate_training_plots(metrics_history: list) -> None:
+    """训练结束后自动生成学习曲线和错误趋势图表。"""
+    if not metrics_history:
+        logger.warning("无训练指标，跳过图表生成")
+        return
+
+    from evaluation.visualizer import PerformanceVisualizer
+    from evaluation.code_visualizer import CodePerformanceVisualizer
+
+    steps = [m["step"] for m in metrics_history]
+    rewards = [m["reward_mean"] for m in metrics_history]
+    losses = [m["loss"] for m in metrics_history]
+
+    # 学习曲线（reward + loss 双轴）
+    perf_viz = PerformanceVisualizer()
+    perf_viz.plot_learning_curve(steps, rewards, losses)
+    logger.info(f"学习曲线已保存: {perf_viz.save_dir}/learning_curve.png")
+
+    # 错误趋势（如果有相关指标）
+    code_viz = CodePerformanceVisualizer()
+    syntax_errors = [m.get("syntax_error_rate", 0) for m in metrics_history]
+    logic_errors = [m.get("logic_error_rate", 0) for m in metrics_history]
+    if any(syntax_errors) or any(logic_errors):
+        code_viz.plot_error_rates_trend(steps, syntax_errors, logic_errors)
+        logger.info(f"错误趋势图已保存: {code_viz.save_dir}/code_error_trend.png")
+    else:
+        logger.info("（无 syntax/logic error 指标，跳过错误趋势图）")
+
+    # KL 散度单独曲线
+    _plot_kl_curve(steps, metrics_history)
+
+    logger.info(f"所有图表已保存到 results/figures/")
+
+
+def _plot_kl_curve(steps: list, metrics_history: list) -> None:
+    """绘制 KL 散度随训练步数的变化曲线。"""
+    import matplotlib.pyplot as plt
+
+    kl_values = [m.get("kl_div", 0) for m in metrics_history]
+    if not any(kl_values):
+        return
+
+    fig_dir = Path("results/figures")
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(steps, kl_values, color="tab:purple", marker=".")
+    plt.xlabel("Training Steps")
+    plt.ylabel("KL Divergence")
+    plt.title("KL Divergence During GRPO Training")
+    plt.grid(True, linestyle=":", alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(fig_dir / "kl_divergence.png")
+    plt.close()
+    logger.info(f"KL 散度曲线已保存: {fig_dir}/kl_divergence.png")
 
 
 def _eval_on_subset(agent, sampler, val_problems, trainer) -> dict:

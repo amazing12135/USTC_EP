@@ -133,6 +133,52 @@ def main() -> None:
         json.dump(history, f, indent=2, ensure_ascii=False, default=str)
     logger.info(f"训练历史: {log_path}")
 
+    # ---- 5. 自动生成图表 ----
+    _generate_rft_plots(history)
+
+
+def _generate_rft_plots(history: dict) -> None:
+    """RFT 训练结束后自动生成轮次准确率图表。"""
+    rounds = history.get("rounds", [])
+    if not rounds:
+        return
+
+    import matplotlib.pyplot as plt
+
+    train_pct = []
+    for c, t in zip(history.get("train_correct", []), history.get("train_total", [])):
+        train_pct.append(c / t * 100 if t > 0 else 0)
+
+    val_acc = [a * 100 for a in history.get("val_accuracy", []) if a is not None]
+
+    fig_dir = Path("results/figures")
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # 子图：训练正确率 + 验证准确率
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    round_labels = [f"Round {r}" for r in rounds]
+
+    ax1.bar(round_labels, train_pct, color="#1f77b4")
+    ax1.set_ylabel("Training Correct Rate (%)")
+    ax1.set_title("RFT Training: Sample Correct Rate per Round")
+    for bar, v in zip(ax1.patches, train_pct):
+        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                 f"{v:.1f}%", ha="center", va="bottom")
+
+    if val_acc:
+        ax2.bar(round_labels, val_acc, color="#2ca02c")
+        ax2.set_ylabel("Validation Accuracy (%)")
+        ax2.set_title("RFT Validation Accuracy per Round")
+        for bar, v in zip(ax2.patches, val_acc):
+            ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                     f"{v:.1f}%", ha="center", va="bottom")
+
+    plt.tight_layout()
+    plt.savefig(fig_dir / "rft_round_accuracy.png")
+    plt.close()
+    logger.info(f"RFT 准确率图已保存: {fig_dir}/rft_round_accuracy.png")
+
 
 def verify_data(problems):
     """验证数据流格式。"""

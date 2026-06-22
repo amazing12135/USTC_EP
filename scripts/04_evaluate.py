@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
         "--from-trajectories", type=str, default=None,
         help="从已保存的轨迹文件评估（跳过推理）",
     )
+    parser.add_argument(
+        "--plot", action="store_true",
+        help="评估后自动生成指标汇总图",
+    )
+    parser.add_argument(
+        "--stage-name", type=str, default=None,
+        help="当前评估的阶段名称（如 sft/rft/grpo），用于图表标注",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +135,8 @@ def evaluate_with_model(
     model_path: Optional[str],
     dataset: str,
     size: int,
+    plot: bool = False,
+    stage_name: Optional[str] = None,
 ) -> None:
     """使用模型进行推理评估（需要 GPU）。"""
     from model.loader import ModelLoader
@@ -191,6 +201,60 @@ def evaluate_with_model(
                 ],
             }, ensure_ascii=False) + "\n")
     logger.info(f"轨迹已保存: {output_path}")
+
+    # 保存评估摘要
+    summary_path = Path("outputs/evals") / f"summary_{dataset}_{len(problems)}.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "stage": stage_name or model_path or "unknown",
+        "dataset": dataset,
+        "size": len(problems),
+        "accuracy": getattr(metrics, "accuracy", 0),
+        "avg_turns": getattr(metrics, "avg_turns", 0),
+        "tool_call_rate": getattr(metrics, "tool_call_rate", 0),
+        "tool_success_rate": getattr(metrics, "tool_success_rate", 0),
+        "format_compliance": getattr(metrics, "format_compliance", 0),
+        "fmt_stats": fmt_stats["percentages"],
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    logger.info(f"评估摘要: {summary_path}")
+
+    if plot:
+        _generate_eval_plots(summary)
+
+
+def _generate_eval_plots(summary: dict) -> None:
+    """根据评估结果生成指标汇总柱状图。"""
+    import matplotlib.pyplot as plt
+
+    metrics_labels = ["Accuracy", "Tool Call", "Tool Success", "Format"]
+    metrics_values = [
+        summary.get("accuracy", 0) * 100,
+        summary.get("tool_call_rate", 0) * 100,
+        summary.get("tool_success_rate", 0) * 100,
+        summary.get("format_compliance", 0) * 100,
+    ]
+    stage = summary.get("stage", "Unknown")
+
+    fig_dir = Path("results/figures")
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(8, 5))
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    bars = plt.bar(metrics_labels, metrics_values, color=colors)
+    plt.ylabel("Percentage (%)")
+    plt.title(f"Evaluation Metrics - {stage}")
+    plt.ylim(0, 105)
+    for bar, v in zip(bars, metrics_values):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                 f"{v:.1f}%", ha="center", va="bottom")
+
+    save_path = fig_dir / f"eval_summary_{stage}.png"
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    logger.info(f"评估汇总图已保存: {save_path}")
 
 
 def evaluate_from_trajectories(traj_path: str) -> None:
@@ -277,7 +341,10 @@ def main() -> None:
     if args.from_trajectories:
         evaluate_from_trajectories(args.from_trajectories)
     else:
-        evaluate_with_model(config, args.model, args.dataset, args.size)
+        evaluate_with_model(
+            config, args.model, args.dataset, args.size,
+            plot=args.plot, stage_name=args.stage_name,
+        )
 
 
 if __name__ == "__main__":
